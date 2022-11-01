@@ -30,6 +30,10 @@ import (
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+
+	"github.com/golang-migrate/migrate/v4"
+	_ "github.com/golang-migrate/migrate/v4/database/postgres"
+	_ "github.com/golang-migrate/migrate/v4/source/file"
 )
 
 const (
@@ -336,6 +340,31 @@ func main() {
 	if err != nil {
 		log.Fatalf("pgConnect() error: %v", err)
 	}
+
+	// DB Migrations
+	log.Println("Starting migrations...")
+
+	migrationsPath, envSet := os.LookupEnv("MIGRATIONS_PATH")
+	if !envSet {
+		log.Fatalf("MIGRATIONS_PATH environment variable not set")
+	}
+
+	migrationsPath = fmt.Sprintf("file://%v", migrationsPath)
+
+	m, err := migrate.New(
+		migrationsPath,
+		os.Getenv("DATABASE_URL"))
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err := m.Up(); err != nil {
+		if !strings.Contains(err.Error(), "no change") {
+			log.Fatal(err)
+		} else {
+			log.Println("No changes to apply")
+		}
+	}
+	log.Println("Migrations completed")
 
 	privateKeyBytes, err := hex.DecodeString(os.Getenv("LSPD_PRIVATE_KEY"))
 	if err != nil {
