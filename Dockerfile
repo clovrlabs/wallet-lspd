@@ -1,5 +1,7 @@
 FROM golang:1.19-alpine as builder
 
+RUN apk add --update build-base
+
 WORKDIR /build
 
 ADD . . 

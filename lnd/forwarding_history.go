@@ -1,17 +1,16 @@
-package main
+package lnd
 
 import (
 	"context"
 	"encoding/hex"
 	"fmt"
 	"log"
-	"os"
 	"time"
 
+	"github.com/breez/lspd/interceptor"
 	"github.com/lightningnetwork/lnd/htlcswitch/hop"
 	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/chainrpc"
-	"google.golang.org/grpc/metadata"
 )
 
 type copyFromEvents struct {
@@ -38,40 +37,66 @@ func (cfe *copyFromEvents) Err() error {
 	return cfe.err
 }
 
-func channelsSynchronize(client chainrpc.ChainNotifierClient) {
+type ForwardingHistorySync struct {
+	client          *LndClient
+	interceptStore  interceptor.InterceptStore
+	forwardingStore ForwardingEventStore
+}
+
+func NewForwardingHistorySync(
+	client *LndClient,
+	interceptStore interceptor.InterceptStore,
+	forwardingStore ForwardingEventStore,
+) *ForwardingHistorySync {
+	return &ForwardingHistorySync{
+		client:          client,
+		interceptStore:  interceptStore,
+		forwardingStore: forwardingStore,
+	}
+}
+
+func (s *ForwardingHistorySync) ChannelsSynchronize(ctx context.Context) {
 	lastSync := time.Now().Add(-6 * time.Minute)
 	for {
-		cancellableCtx, cancel := context.WithCancel(context.Background())
-		clientCtx := metadata.AppendToOutgoingContext(cancellableCtx, "macaroon", os.Getenv("LND_MACAROON_HEX"))
-		stream, err := client.RegisterBlockEpochNtfn(clientCtx, &chainrpc.BlockEpoch{})
+		if ctx.Err() != nil {
+			return
+		}
+
+		stream, err := s.client.chainNotifierClient.RegisterBlockEpochNtfn(ctx, &chainrpc.BlockEpoch{})
 		if err != nil {
 			log.Printf("chainNotifierClient.RegisterBlockEpochNtfn(): %v", err)
-			cancel()
-			time.Sleep(1 * time.Second)
+			<-time.After(time.Second)
 			continue
 		}
 
 		for {
+			if ctx.Err() != nil {
+				return
+			}
+
 			_, err := stream.Recv()
 			if err != nil {
 				log.Printf("stream.Recv: %v", err)
+				<-time.After(time.Second)
 				break
 			}
 			if lastSync.Add(5 * time.Minute).Before(time.Now()) {
-				time.Sleep(30 * time.Second)
-				err = channelsSynchronizeOnce()
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(1 * time.Minute):
+				}
+				err = s.ChannelsSynchronizeOnce()
 				lastSync = time.Now()
 				log.Printf("channelsSynchronizeOnce() err: %v", err)
 			}
 		}
-		cancel()
 	}
 }
 
-func channelsSynchronizeOnce() error {
+func (s *ForwardingHistorySync) ChannelsSynchronizeOnce() error {
 	log.Printf("channelsSynchronizeOnce - begin")
-	clientCtx := metadata.AppendToOutgoingContext(context.Background(), "macaroon", os.Getenv("LND_MACAROON_HEX"))
-	channels, err := client.ListChannels(clientCtx, &lnrpc.ListChannelsRequest{PrivateOnly: true})
+	channels, err := s.client.client.ListChannels(context.Background(), &lnrpc.ListChannelsRequest{PrivateOnly: true})
 	if err != nil {
 		log.Printf("ListChannels error: %v", err)
 		return fmt.Errorf("client.ListChannels() error: %w", err)
@@ -91,7 +116,7 @@ func channelsSynchronizeOnce() error {
 				confirmedChanId = 0
 			}
 		}
-		err = insertChannel(c.ChanId, confirmedChanId, c.ChannelPoint, nodeID, lastUpdate)
+		err = s.interceptStore.InsertChannel(c.ChanId, confirmedChanId, c.ChannelPoint, nodeID, lastUpdate)
 		if err != nil {
 			log.Printf("insertChannel(%v, %v, %x) in channelsSynchronizeOnce error: %v", c.ChanId, c.ChannelPoint, nodeID, err)
 			continue
@@ -102,16 +127,23 @@ func channelsSynchronizeOnce() error {
 	return nil
 }
 
-func forwardingHistorySynchronize() {
+func (s *ForwardingHistorySync) ForwardingHistorySynchronize(ctx context.Context) {
 	for {
-		err := forwardingHistorySynchronizeOnce()
+		if ctx.Err() != nil {
+			return
+		}
+
+		err := s.ForwardingHistorySynchronizeOnce()
 		log.Printf("forwardingHistorySynchronizeOnce() err: %v", err)
-		time.Sleep(1 * time.Minute)
+		select {
+		case <-time.After(1 * time.Minute):
+		case <-ctx.Done():
+		}
 	}
 }
 
-func forwardingHistorySynchronizeOnce() error {
-	last, err := lastForwardingEvent()
+func (s *ForwardingHistorySync) ForwardingHistorySynchronizeOnce() error {
+	last, err := s.forwardingStore.LastForwardingEvent()
 	if err != nil {
 		return fmt.Errorf("lastForwardingEvent() error: %w", err)
 	}
@@ -123,10 +155,9 @@ func forwardingHistorySynchronizeOnce() error {
 	log.Printf("last2: %v", last)
 	now := time.Now()
 	endTime := uint64(now.Add(time.Hour * 24).Unix())
-	clientCtx := metadata.AppendToOutgoingContext(context.Background(), "macaroon", os.Getenv("LND_MACAROON_HEX"))
 	indexOffset := uint32(0)
 	for {
-		forwardHistory, err := client.ForwardingHistory(clientCtx, &lnrpc.ForwardingHistoryRequest{
+		forwardHistory, err := s.client.client.ForwardingHistory(context.Background(), &lnrpc.ForwardingHistoryRequest{
 			StartTime:    uint64(last),
 			EndTime:      endTime,
 			NumMaxEvents: 10000,
@@ -142,7 +173,7 @@ func forwardingHistorySynchronizeOnce() error {
 		}
 		indexOffset = forwardHistory.LastOffsetIndex
 		cfe := copyFromEvents{events: forwardHistory.ForwardingEvents, idx: -1}
-		err = insertForwardingEvents(&cfe)
+		err = s.forwardingStore.InsertForwardingEvents(&cfe)
 		if err != nil {
 			log.Printf("insertForwardingEvents() error: %v", err)
 			return fmt.Errorf("insertForwardingEvents() error: %w", err)
