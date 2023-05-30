@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"time"
 
 	"github.com/breez/lntest"
 	"github.com/breez/lspd/config"
@@ -19,6 +20,7 @@ import (
 	"github.com/decred/dcrd/dcrec/secp256k1/v4"
 	ecies "github.com/ecies/go/v2"
 	"github.com/golang/protobuf/proto"
+	"github.com/jackc/pgx/v4/pgxpool"
 )
 
 var (
@@ -60,7 +62,7 @@ type lspBase struct {
 	postgresBackend *PostgresContainer
 }
 
-func newLspd(h *lntest.TestHarness, name string, nodeConfig *config.NodeConfig, lnd *config.LndConfig, cln *config.ClnConfig, envExt ...string) (*lspBase, error) {
+func newLspd(h *lntest.TestHarness, mem *mempoolApi, name string, nodeConfig *config.NodeConfig, lnd *config.LndConfig, cln *config.ClnConfig, envExt ...string) (*lspBase, error) {
 	scriptDir := h.GetDirectory(fmt.Sprintf("lspd-%s", name))
 	log.Printf("%s: Creating LSPD in dir %s", name, scriptDir)
 
@@ -126,8 +128,7 @@ func newLspd(h *lntest.TestHarness, name string, nodeConfig *config.NodeConfig, 
 		nodes,
 		fmt.Sprintf("DATABASE_URL=%s", postgresBackend.ConnectionString()),
 		fmt.Sprintf("LISTEN_ADDRESS=%s", grpcAddress),
-		"USE_MEMPOOL_FEE_ESTIMATION=true",
-		"MEMPOOL_API_BASE_URL=https://mempool.space/api/v1/",
+		fmt.Sprintf("MEMPOOL_API_BASE_URL=%s", mem.Address()),
 		"MEMPOOL_PRIORITY=economy",
 	}
 
@@ -183,6 +184,25 @@ func (l *lspBase) Initialize() error {
 		return err
 	}
 
+	pgxPool, err := pgxpool.Connect(l.harness.Ctx, l.postgresBackend.ConnectionString())
+	if err != nil {
+		lntest.PerformCleanup(cleanups)
+		return fmt.Errorf("failed to connect to postgres: %w", err)
+	}
+	defer pgxPool.Close()
+
+	_, err = pgxPool.Exec(
+		l.harness.Ctx,
+		`INSERT INTO new_channel_params (validity, params)
+		 VALUES 
+		  (3600, '{"min_msat": "1000000", "proportional": 7500, "max_idle_time": 4320, "max_client_to_self_delay": 432}'),
+		  (259200, '{"min_msat": "1100000", "proportional": 7500, "max_idle_time": 4320, "max_client_to_self_delay": 432}');`,
+	)
+	if err != nil {
+		lntest.PerformCleanup(cleanups)
+		return fmt.Errorf("failed to insert new_channel_params: %w", err)
+	}
+
 	log.Printf("%s: Creating lspd startup script at %s", l.name, l.scriptFilePath)
 	scriptFile, err := os.OpenFile(l.scriptFilePath, os.O_CREATE|os.O_WRONLY, 0755)
 	if err != nil {
@@ -221,7 +241,19 @@ func (l *lspBase) Initialize() error {
 	return nil
 }
 
-func RegisterPayment(l LspNode, paymentInfo *lspd.PaymentInformation) {
+func ChannelInformation(l LspNode) *lspd.ChannelInformationReply {
+	info, err := l.Rpc().ChannelInformation(
+		l.Harness().Ctx,
+		&lspd.ChannelInformationRequest{},
+	)
+	if err != nil {
+		l.Harness().T.Fatalf("Failed to get ChannelInformation: %v", err)
+	}
+
+	return info
+}
+
+func RegisterPayment(l LspNode, paymentInfo *lspd.PaymentInformation, continueOnError bool) error {
 	serialized, err := proto.Marshal(paymentInfo)
 	lntest.CheckError(l.Harness().T, err)
 
@@ -235,7 +267,59 @@ func RegisterPayment(l LspNode, paymentInfo *lspd.PaymentInformation) {
 			Blob: encrypted,
 		},
 	)
-	lntest.CheckError(l.Harness().T, err)
+
+	if !continueOnError {
+		lntest.CheckError(l.Harness().T, err)
+	}
+
+	return err
+}
+
+type FeeParamSetting struct {
+	Validity     time.Duration
+	MinMsat      uint64
+	Proportional uint32
+}
+
+func SetFeeParams(l LspNode, settings []*FeeParamSetting) error {
+	pgxPool, err := pgxpool.Connect(l.Harness().Ctx, l.PostgresBackend().ConnectionString())
+	if err != nil {
+		return fmt.Errorf("failed to connect to postgres: %w", err)
+	}
+	defer pgxPool.Close()
+
+	_, err = pgxPool.Exec(l.Harness().Ctx, "DELETE FROM new_channel_params")
+	if err != nil {
+		return fmt.Errorf("failed to delete new_channel_params: %w", err)
+	}
+
+	if len(settings) == 0 {
+		return nil
+	}
+
+	query := `INSERT INTO new_channel_params (validity, params) VALUES `
+	first := true
+	for _, setting := range settings {
+		if !first {
+			query += `,`
+		}
+
+		query += fmt.Sprintf(
+			`(%d, '{"min_msat": "%d", "proportional": %d, "max_idle_time": 4320, "max_client_to_self_delay": 432}')`,
+			int64(setting.Validity.Seconds()),
+			setting.MinMsat,
+			setting.Proportional,
+		)
+
+		first = false
+	}
+	query += `;`
+	_, err = pgxPool.Exec(l.Harness().Ctx, query)
+	if err != nil {
+		return fmt.Errorf("failed to insert new_channel_params: %w", err)
+	}
+
+	return nil
 }
 
 func getLspdBinary() (string, error) {

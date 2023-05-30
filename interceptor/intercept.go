@@ -9,6 +9,7 @@ import (
 	"math/big"
 	"time"
 
+	"github.com/breez/lspd/basetypes"
 	"github.com/breez/lspd/chain"
 	"github.com/breez/lspd/config"
 	"github.com/breez/lspd/lightning"
@@ -75,7 +76,7 @@ func NewInterceptor(
 func (i *Interceptor) Intercept(nextHop string, reqPaymentHash []byte, reqOutgoingAmountMsat uint64, reqOutgoingExpiry uint32, reqIncomingExpiry uint32) InterceptResult {
 	reqPaymentHashStr := hex.EncodeToString(reqPaymentHash)
 	resp, _, _ := i.payHashGroup.Do(reqPaymentHashStr, func() (interface{}, error) {
-		paymentHash, paymentSecret, destination, incomingAmountMsat, outgoingAmountMsat, channelPoint, err := i.store.PaymentInfo(reqPaymentHash)
+		params, paymentHash, paymentSecret, destination, incomingAmountMsat, outgoingAmountMsat, channelPoint, err := i.store.PaymentInfo(reqPaymentHash)
 		if err != nil {
 			log.Printf("paymentInfo(%x) error: %v", reqPaymentHash, err)
 			return InterceptResult{
@@ -93,11 +94,44 @@ func (i *Interceptor) Intercept(nextHop string, reqPaymentHash []byte, reqOutgoi
 
 		if channelPoint == nil {
 			if bytes.Equal(paymentHash, reqPaymentHash) {
+				// TODO: When opening_fee_params is enforced, turn this check in a temporary channel failure.
+				if params == nil {
+					log.Printf("DEPRECATED: Intercepted htlc with deprecated fee mechanism.")
+					params = &OpeningFeeParams{
+						MinMsat:              uint64(i.config.ChannelMinimumFeeMsat),
+						Proportional:         uint32(i.config.ChannelFeePermyriad * 100),
+						ValidUntil:           time.Now().UTC().Add(time.Duration(time.Hour * 24)).Format(basetypes.TIME_FORMAT),
+						MaxIdleTime:          uint32(i.config.MaxInactiveDuration / 600),
+						MaxClientToSelfDelay: uint32(10000),
+					}
+				}
+
 				if int64(reqIncomingExpiry)-int64(reqOutgoingExpiry) < int64(i.config.TimeLockDelta) {
 					return InterceptResult{
 						Action:      INTERCEPT_FAIL_HTLC_WITH_CODE,
 						FailureCode: FAILURE_TEMPORARY_CHANNEL_FAILURE,
 					}, nil
+				}
+
+				validUntil, err := time.Parse(basetypes.TIME_FORMAT, params.ValidUntil)
+				if err != nil {
+					log.Printf("time.Parse(%s, %s) failed. Failing channel open: %v", basetypes.TIME_FORMAT, params.ValidUntil, err)
+					return InterceptResult{
+						Action:      INTERCEPT_FAIL_HTLC_WITH_CODE,
+						FailureCode: FAILURE_TEMPORARY_CHANNEL_FAILURE,
+					}, nil
+				}
+
+				if time.Now().UTC().After(validUntil) {
+					if !i.isCurrentChainFeeCheaper(params) {
+						log.Printf("Intercepted expired payment registration. Failing payment. payment hash: %x, valid until: %s", paymentHash, params.ValidUntil)
+						return InterceptResult{
+							Action:      INTERCEPT_FAIL_HTLC_WITH_CODE,
+							FailureCode: FAILURE_TEMPORARY_CHANNEL_FAILURE,
+						}, nil
+					}
+
+					log.Printf("Intercepted expired payment registration. Opening channel anyway, because it's cheaper at the current rate. %+v", params)
 				}
 
 				channelPoint, err = i.openChannel(reqPaymentHash, destination, incomingAmountMsat)
@@ -245,6 +279,22 @@ func (i *Interceptor) Intercept(nextHop string, reqPaymentHash []byte, reqOutgoi
 	})
 
 	return resp.(InterceptResult)
+}
+
+func (i *Interceptor) isCurrentChainFeeCheaper(params *OpeningFeeParams) bool {
+	settings, err := i.store.GetFeeParamsSettings()
+	if err != nil {
+		log.Printf("Failed to get fee params settings: %v", err)
+		return false
+	}
+
+	for _, setting := range settings {
+		if setting.Params.MinMsat <= params.MinMsat {
+			return true
+		}
+	}
+
+	return false
 }
 
 func (i *Interceptor) openChannel(paymentHash, destination []byte, incomingAmountMsat int64) (*wire.OutPoint, error) {

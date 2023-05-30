@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
@@ -9,8 +10,11 @@ import (
 	"log"
 	"net"
 	"os"
+	"sort"
 	"strings"
+	"time"
 
+	"github.com/breez/lspd/basetypes"
 	"github.com/breez/lspd/btceclegacy"
 	"github.com/breez/lspd/cln"
 	"github.com/breez/lspd/config"
@@ -34,6 +38,13 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+
+	"github.com/btcsuite/btcd/btcec/v2"
+	"github.com/btcsuite/btcd/btcec/v2/ecdsa"
+	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	"github.com/btcsuite/btcd/wire"
+	"github.com/caddyserver/certmagic"
+	"github.com/lightningnetwork/lnd/lnwire"
 )
 
 type server struct {
@@ -62,6 +73,11 @@ func (s *server) ChannelInformation(ctx context.Context, in *lspdrpc.ChannelInfo
 		return nil, err
 	}
 
+	params, err := s.createOpeningParamsMenu(ctx, node)
+	if err != nil {
+		return nil, err
+	}
+
 	return &lspdrpc.ChannelInformationReply{
 		Name:                  node.nodeConfig.Name,
 		Pubkey:                node.nodeConfig.NodePubkey,
@@ -76,10 +92,131 @@ func (s *server) ChannelInformation(ctx context.Context, in *lspdrpc.ChannelInfo
 		ChannelMinimumFeeMsat: int64(node.nodeConfig.ChannelMinimumFeeMsat),
 		LspPubkey:             node.publicKey.SerializeCompressed(), // TODO: Is the publicKey different from the ecies public key?
 		MaxInactiveDuration:   int64(node.nodeConfig.MaxInactiveDuration),
+		OpeningFeeParamsMenu:  params,
 	}, nil
 }
 
-func (s *server) RegisterPayment(ctx context.Context, in *lspdrpc.RegisterPaymentRequest) (*lspdrpc.RegisterPaymentReply, error) {
+func (s *server) createOpeningParamsMenu(
+	ctx context.Context,
+	node *node,
+) ([]*lspdrpc.OpeningFeeParams, error) {
+	var menu []*lspdrpc.OpeningFeeParams
+
+	settings, err := s.store.GetFeeParamsSettings()
+	if err != nil {
+		log.Printf("Failed to fetch fee params settings: %v", err)
+		return nil, fmt.Errorf("failed to get opening_fee_params")
+	}
+
+	for _, setting := range settings {
+		validUntil := time.Now().UTC().Add(setting.Validity)
+		params := &lspdrpc.OpeningFeeParams{
+			MinMsat:              setting.Params.MinMsat,
+			Proportional:         setting.Params.Proportional,
+			ValidUntil:           validUntil.Format(basetypes.TIME_FORMAT),
+			MaxIdleTime:          setting.Params.MaxIdleTime,
+			MaxClientToSelfDelay: setting.Params.MaxClientToSelfDelay,
+		}
+
+		promise, err := createPromise(node, params)
+		if err != nil {
+			log.Printf("Failed to create promise: %v", err)
+			return nil, err
+		}
+
+		params.Promise = *promise
+		menu = append(menu, params)
+	}
+
+	sort.Slice(menu, func(i, j int) bool {
+		return menu[i].MinMsat < menu[j].MinMsat
+	})
+	return menu, nil
+}
+
+func paramsHash(params *lspdrpc.OpeningFeeParams) ([]byte, error) {
+	// First hash all the values in the params in a fixed order.
+	items := []interface{}{
+		params.MinMsat,
+		params.Proportional,
+		params.ValidUntil,
+		params.MaxIdleTime,
+		params.MaxClientToSelfDelay,
+	}
+	blob, err := json.Marshal(items)
+	if err != nil {
+		log.Printf("paramsHash error: %v", err)
+		return nil, err
+	}
+	hash := sha256.Sum256(blob)
+	return hash[:], nil
+}
+
+func createPromise(node *node, params *lspdrpc.OpeningFeeParams) (*string, error) {
+	hash, err := paramsHash(params)
+	if err != nil {
+		return nil, err
+	}
+	// Sign the hash with the private key of the LSP id.
+	sig, err := ecdsa.SignCompact(node.privateKey, hash[:], true)
+	if err != nil {
+		log.Printf("createPromise: SignCompact error: %v", err)
+		return nil, err
+	}
+	promise := hex.EncodeToString(sig)
+	return &promise, nil
+}
+
+func verifyPromise(node *node, params *lspdrpc.OpeningFeeParams) error {
+	hash, err := paramsHash(params)
+	if err != nil {
+		return err
+	}
+	sig, err := hex.DecodeString(params.Promise)
+	if err != nil {
+		log.Printf("verifyPromise: hex.DecodeString error: %v", err)
+		return err
+	}
+	pub, _, err := ecdsa.RecoverCompact(sig, hash)
+	if err != nil {
+		log.Printf("verifyPromise: RecoverCompact(%x) error: %v", sig, err)
+		return err
+	}
+	if !node.publicKey.IsEqual(pub) {
+		log.Print("verifyPromise: not signed by us", err)
+		return fmt.Errorf("invalid promise")
+	}
+	return nil
+}
+
+func validateOpeningFeeParams(node *node, params *lspdrpc.OpeningFeeParams) bool {
+	if params == nil {
+		return false
+	}
+
+	err := verifyPromise(node, params)
+	if err != nil {
+		return false
+	}
+
+	t, err := time.Parse(basetypes.TIME_FORMAT, params.ValidUntil)
+	if err != nil {
+		log.Printf("validateOpeningFeeParams: time.Parse(%v, %v) error: %v", basetypes.TIME_FORMAT, params.ValidUntil, err)
+		return false
+	}
+
+	if time.Now().UTC().After(t) {
+		log.Printf("validateOpeningFeeParams: promise not valid anymore: %v", t)
+		return false
+	}
+
+	return true
+}
+
+func (s *server) RegisterPayment(
+	ctx context.Context,
+	in *lspdrpc.RegisterPaymentRequest,
+) (*lspdrpc.RegisterPaymentReply, error) {
 	node, err := getNode(ctx)
 	if err != nil {
 		return nil, err
@@ -116,12 +253,38 @@ func (s *server) RegisterPayment(ctx context.Context, in *lspdrpc.RegisterPaymen
 		}
 	}
 
-	err = checkPayment(node.nodeConfig, pi.IncomingAmountMsat, pi.OutgoingAmountMsat)
+	// TODO: Remove this nil check and the else cluase when we enforce all
+	// clients to use opening_fee_params.
+	if pi.OpeningFeeParams != nil {
+		valid := validateOpeningFeeParams(node, pi.OpeningFeeParams)
+		if !valid {
+			return nil, fmt.Errorf("invalid opening_fee_params")
+		}
+	} else {
+		log.Printf("DEPRECATED: RegisterPayment with deprecated fee mechanism.")
+		pi.OpeningFeeParams = &lspdrpc.OpeningFeeParams{
+			MinMsat:              uint64(node.nodeConfig.ChannelMinimumFeeMsat),
+			Proportional:         uint32(node.nodeConfig.ChannelFeePermyriad * 100),
+			ValidUntil:           time.Now().UTC().Add(time.Duration(time.Hour * 24)).Format(basetypes.TIME_FORMAT),
+			MaxIdleTime:          uint32(node.nodeConfig.MaxInactiveDuration / 600),
+			MaxClientToSelfDelay: uint32(10000),
+		}
+	}
+
+	err = checkPayment(pi.OpeningFeeParams, pi.IncomingAmountMsat, pi.OutgoingAmountMsat)
 	if err != nil {
 		log.Printf("checkPayment(%v, %v) error: %v", pi.IncomingAmountMsat, pi.OutgoingAmountMsat, err)
 		return nil, fmt.Errorf("checkPayment(%v, %v) error: %v", pi.IncomingAmountMsat, pi.OutgoingAmountMsat, err)
 	}
-	err = s.store.RegisterPayment(pi.Destination, pi.PaymentHash, pi.PaymentSecret, pi.IncomingAmountMsat, pi.OutgoingAmountMsat, pi.Tag)
+	params := &interceptor.OpeningFeeParams{
+		MinMsat:              pi.OpeningFeeParams.MinMsat,
+		Proportional:         pi.OpeningFeeParams.Proportional,
+		ValidUntil:           pi.OpeningFeeParams.ValidUntil,
+		MaxIdleTime:          pi.OpeningFeeParams.MaxIdleTime,
+		MaxClientToSelfDelay: pi.OpeningFeeParams.MaxClientToSelfDelay,
+		Promise:              pi.OpeningFeeParams.Promise,
+	}
+	err = s.store.RegisterPayment(params, pi.Destination, pi.PaymentHash, pi.PaymentSecret, pi.IncomingAmountMsat, pi.OutgoingAmountMsat, pi.Tag)
 	if err != nil {
 		log.Printf("RegisterPayment() error: %v", err)
 		return nil, fmt.Errorf("RegisterPayment() error: %w", err)
@@ -448,10 +611,10 @@ func getNode(ctx context.Context) (*node, error) {
 	return node, nil
 }
 
-func checkPayment(config *config.NodeConfig, incomingAmountMsat, outgoingAmountMsat int64) error {
-	fees := incomingAmountMsat * config.ChannelFeePermyriad / 10_000 / 1_000 * 1_000
-	if fees < config.ChannelMinimumFeeMsat {
-		fees = config.ChannelMinimumFeeMsat
+func checkPayment(params *lspdrpc.OpeningFeeParams, incomingAmountMsat, outgoingAmountMsat int64) error {
+	fees := incomingAmountMsat * int64(params.Proportional) / 1_000_000 / 1_000 * 1_000
+	if fees < int64(params.MinMsat) {
+		fees = int64(params.MinMsat)
 	}
 	if incomingAmountMsat-outgoingAmountMsat < fees {
 		return fmt.Errorf("not enough fees")
